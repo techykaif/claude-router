@@ -16,6 +16,8 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)
 ROUTER_SCRIPT_DIR="$script_dir"
 export ROUTER_SCRIPT_DIR
+ROUTER_JSONC_HELPER="$script_dir/jsonc-parse.js"
+export ROUTER_JSONC_HELPER
 # shellcheck source=common.sh
 . "$script_dir/common.sh"
 
@@ -85,17 +87,25 @@ fi
 
 # Reading and writing the settings file both go through node, for the same
 # reason common.sh does: it is the one JSON parser a Claude Code user is
-# guaranteed to have.
+# guaranteed to have. Status also accepts VSCode's JSONC syntax, while writes
+# intentionally refuse JSONC so comments cannot be destroyed by JSON.stringify.
 if [ "$mode" = 'status' ]; then
-    ROUTER_SETTINGS_PATH="$settings_path" ROUTER_SETTINGS_KEY="$settings_key" node -e '
+    ROUTER_SETTINGS_PATH="$settings_path" ROUTER_SETTINGS_KEY="$settings_key" \
+    ROUTER_JSONC_HELPER="$ROUTER_JSONC_HELPER" node -e '
 const fs = require("fs");
 const path = process.env.ROUTER_SETTINGS_PATH;
+const { parseJsonc } = require(process.env.ROUTER_JSONC_HELPER);
 let settings;
+const source = fs.readFileSync(path, "utf8");
 try {
-    settings = JSON.parse(fs.readFileSync(path, "utf8"));
+    settings = JSON.parse(source);
 } catch (err) {
-    console.error(`Invalid JSON in VSCode settings ${JSON.stringify(path)}: ${err.message}`);
-    process.exit(1);
+    try {
+        settings = parseJsonc(source).value;
+    } catch (_) {
+        console.error(`Invalid JSON in VSCode settings ${JSON.stringify(path)}: ${err.message}`);
+        process.exit(1);
+    }
 }
 const entries = Array.isArray(settings?.[process.env.ROUTER_SETTINGS_KEY])
     ? settings[process.env.ROUTER_SETTINGS_KEY]
@@ -120,16 +130,28 @@ if [ "$mode" = 'on' ]; then
     router_load_config "$config_path" || exit 1
 fi
 
-# Parse before copying. A file the toolkit cannot read is refused without
-# leaving a `.bak-claude-router` next to it, so the presence of that file always
-# means a write was attempted rather than merely considered.
-ROUTER_SETTINGS_PATH="$settings_path" node -e '
+# Parse before copying. Strict JSON is writable. If strict parsing fails but
+# JSONC parsing succeeds, refuse the write before creating the backup because
+# rewriting the file would discard comments and could alter user formatting.
+ROUTER_SETTINGS_PATH="$settings_path" ROUTER_JSONC_HELPER="$ROUTER_JSONC_HELPER" node -e '
 const fs = require("fs");
 const path = process.env.ROUTER_SETTINGS_PATH;
+const { parseJsonc } = require(process.env.ROUTER_JSONC_HELPER);
+const source = fs.readFileSync(path, "utf8");
 let settings;
 try {
-    settings = JSON.parse(fs.readFileSync(path, "utf8"));
+    settings = JSON.parse(source);
 } catch (err) {
+    try {
+        const parsed = parseJsonc(source);
+        if (parsed.changed) {
+            console.error(`Refusing to modify JSONC VSCode settings ${JSON.stringify(path)}; comments or trailing commas would be lost.`);
+            process.exit(1);
+        }
+    } catch (_) {
+        console.error(`Invalid JSON in VSCode settings ${JSON.stringify(path)}: ${err.message}`);
+        process.exit(1);
+    }
     console.error(`Invalid JSON in VSCode settings ${JSON.stringify(path)}: ${err.message}`);
     process.exit(1);
 }
